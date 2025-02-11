@@ -7,7 +7,7 @@ import {
 	type FindOptionsRelations,
 	type FindOptionsWhere,
 } from '@n8n/typeorm';
-import { Credentials, Logger } from 'n8n-core';
+import { CredentialDataError, Credentials, ErrorReporter, Logger } from 'n8n-core';
 import type {
 	ICredentialDataDecryptedObject,
 	ICredentialsDecrypted,
@@ -51,6 +51,7 @@ export class CredentialsService {
 		private readonly sharedCredentialsRepository: SharedCredentialsRepository,
 		private readonly ownershipService: OwnershipService,
 		private readonly logger: Logger,
+		private readonly errorReporter: ErrorReporter,
 		private readonly credentialsTester: CredentialsTester,
 		private readonly externalHooks: ExternalHooks,
 		private readonly credentialTypes: CredentialTypes,
@@ -330,11 +331,23 @@ export class CredentialsService {
 	 */
 	decrypt(credential: CredentialsEntity, includeRawData = false) {
 		const coreCredential = createCredentialsFromCredentialsEntity(credential);
-		const data = coreCredential.getData();
-		if (includeRawData) {
-			return data;
+		try {
+			const data = coreCredential.getData();
+			if (includeRawData) {
+				return data;
+			}
+			return this.redact(data, credential);
+		} catch (error) {
+			if (error instanceof CredentialDataError) {
+				this.errorReporter.error(error, {
+					level: 'error',
+					extra: { credentialId: credential.id },
+					tags: { credentialType: credential.type },
+				});
+				return {};
+			}
+			throw error;
 		}
-		return this.redact(data, credential);
 	}
 
 	async update(credentialId: string, newCredentialData: ICredentialsDb) {
@@ -406,10 +419,26 @@ export class CredentialsService {
 		return result;
 	}
 
-	async delete(credentials: CredentialsEntity) {
-		await this.externalHooks.run('credentials.delete', [credentials.id]);
+	/**
+	 * Deletes a credential.
+	 *
+	 * If the user does not have permission to delete the credential this does
+	 * nothing and returns void.
+	 */
+	async delete(user: User, credentialId: string) {
+		await this.externalHooks.run('credentials.delete', [credentialId]);
 
-		await this.credentialsRepository.remove(credentials);
+		const credential = await this.sharedCredentialsRepository.findCredentialForUser(
+			credentialId,
+			user,
+			['credential:delete'],
+		);
+
+		if (!credential) {
+			return;
+		}
+
+		await this.credentialsRepository.remove(credential);
 	}
 
 	async test(user: User, credentials: ICredentialsDecrypted) {
